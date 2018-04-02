@@ -8,24 +8,24 @@
 # DROPBOX_OAUTH2_TOKEN = 'YourOauthToken'
 # DROPBOX_ROOT_PATH = '/dir/'
 
-from __future__ import absolute_import
+from __future__ import absolute_import, unicode_literals
 
-from datetime import datetime
-from shutil import copyfileobj
-from tempfile import SpooledTemporaryFile
+from tempfile import NamedTemporaryFile
 
 from django.core.exceptions import ImproperlyConfigured
 from django.core.files.base import File
 from django.core.files.storage import Storage
-from django.utils._os import safe_join
 from django.utils.deconstruct import deconstructible
 from dropbox import Dropbox
 from dropbox.exceptions import ApiError
-from dropbox.files import CommitInfo, UploadSessionCursor
+from dropbox.files import CommitInfo, FolderMetadata, UploadSessionCursor
 
 from storages.utils import setting
 
-DATE_FORMAT = '%a, %d %b %Y %X +0000'
+try:
+    from pathlib import PurePosixPath
+except ImportError:  # Python 3.3 and below
+    from pathlib2 import PurePosixPath
 
 
 class DropBoxStorageException(Exception):
@@ -40,10 +40,11 @@ class DropBoxFile(File):
     @property
     def file(self):
         if not hasattr(self, '_file'):
-            response = self._storage.client.files_download(self.name)
-            self._file = SpooledTemporaryFile()
-            copyfileobj(response, self._file)
+            self._file = NamedTemporaryFile()
+            self._storage.client.files_download_to_file(self._file.name,
+                                                        self.name)
             self._file.seek(0)
+
         return self._file
 
 
@@ -61,10 +62,14 @@ class DropBoxStorage(Storage):
                                        "'settings.DROPBOX_OAUTH2_TOKEN'.")
         self.client = Dropbox(oauth2_access_token)
 
-    def _full_path(self, name):
-        if name == '/':
-            name = ''
-        return safe_join(self.root_path, name).replace('\\', '/')
+    def _full_path(self, path):
+        path = PurePosixPath(self.root_path) / path
+        path = str(path)
+
+        if path == '/':
+            path = ''
+
+        return path
 
     def delete(self, name):
         self.client.files_delete(self._full_path(name))
@@ -78,45 +83,53 @@ class DropBoxStorage(Storage):
     def listdir(self, path):
         directories, files = [], []
         full_path = self._full_path(path)
-        metadata = self.client.files_get_metadata(full_path)
-        for entry in metadata['contents']:
-            entry['path'] = entry['path'].replace(full_path, '', 1)
-            entry['path'] = entry['path'].replace('/', '', 1)
-            if entry['is_dir']:
-                directories.append(entry['path'])
+        result = self.client.files_list_folder(full_path)
+
+        for entry in result.entries:
+            if isinstance(entry, FolderMetadata):
+                directories.append(entry.name)
             else:
-                files.append(entry['path'])
+                files.append(entry.name)
+
+        assert not result.has_more, "FIXME: Not implemented!"
+
         return directories, files
 
     def size(self, name):
         metadata = self.client.files_get_metadata(self._full_path(name))
-        return metadata['bytes']
+        return metadata.size
 
     def modified_time(self, name):
         metadata = self.client.files_get_metadata(self._full_path(name))
-        mod_time = datetime.strptime(metadata['modified'], DATE_FORMAT)
-        return mod_time
+        return metadata.server_modified
 
     def accessed_time(self, name):
         metadata = self.client.files_get_metadata(self._full_path(name))
-        acc_time = datetime.strptime(metadata['client_mtime'], DATE_FORMAT)
-        return acc_time
+        # Note to the unwary, this is actually an mtime
+        return metadata.client_modified
 
     def url(self, name):
-        media = self.client.files_get_temporary_link(self._full_path(name))
-        return media.link
+        try:
+            media = self.client.files_get_temporary_link(self._full_path(name))
+            return media.link
+        except ApiError:
+            raise ValueError("This file is not accessible via a URL.")
 
     def _open(self, name, mode='rb'):
-        remote_file = DropBoxFile(self._full_path(name), self)
-        return remote_file
+        return DropBoxFile(self._full_path(name), self)
 
     def _save(self, name, content):
-        content.open()
-        if content.size <= self.CHUNK_SIZE:
-            self.client.files_upload(content.read(), self._full_path(name))
-        else:
-            self._chunked_upload(content, self._full_path(name))
-        content.close()
+        try:
+            content.open()
+
+            if content.size <= self.CHUNK_SIZE:
+                self.client.files_upload(content.read(), self._full_path(name))
+            else:
+                self._chunked_upload(content, self._full_path(name))
+
+        finally:
+            content.close()
+
         return name
 
     def _chunked_upload(self, content, dest_path):
